@@ -77,11 +77,13 @@ def extrair_numeros_processos_pagina(page):
 
 
 def achar_no_paginador(page, classe):
-    """Primeiro elemento visível com essa classe no paginador de cima ou no de baixo, ou None."""
+    """Primeiro elemento visível com essa classe no paginador de cima ou no de baixo, ou None.
+    (Sem filter(visible=True): ele não existe no Playwright antigo e quebrava a paginação.)"""
     for paginador in SEL["paginadores"]:
-        alvo = page.locator(f"{paginador} {classe}").filter(visible=True)
-        if alvo.count():
-            return alvo.first
+        alvos = page.locator(f"{paginador} {classe}")
+        for i in range(alvos.count()):
+            if alvos.nth(i).is_visible():
+                return alvos.nth(i)
     return None
 
 
@@ -109,15 +111,68 @@ def obter_total_paginas(page, timeout=15):
     return 1
 
 
+def esperar_troca(page, antes, timeout):
+    """True se a lista mudar (ficar diferente de 'antes') dentro do prazo."""
+    limite = time.time() + timeout
+    while time.time() < limite:
+        page.wait_for_timeout(500)
+        agora = extrair_numeros_processos_pagina(page)
+        if agora and agora != antes:
+            page.wait_for_timeout(1000)
+            return True
+    return False
+
+
+def clicar(btn):
+    """Clique normal; se algo cobrir o botão (aviso de carregando etc.), clique direto no elemento."""
+    try:
+        btn.click(timeout=10000)
+    except Exception as e:
+        print(f" Clique normal falhou ({type(e).__name__}); tentando clique direto.")
+        btn.dispatch_event("click")
+
+
+def ir_para_primeira_pagina(page):
+    """Garante que a coleta começa na página 1."""
+    try:
+        btn = achar_no_paginador(page, ".ui-paginator-first")
+        if btn is None or "ui-state-disabled" in (btn.get_attribute("class") or ""):
+            return
+        print(" A lista não está na página 1; voltando para ela.")
+        antes = extrair_numeros_processos_pagina(page)
+        clicar(btn)
+        esperar_troca(page, antes, 30)
+    except Exception as e:
+        print(f" Não consegui voltar para a página 1: {e}")
+
+
+def avancar_manual(page, antes):
+    """Quando o script não consegue trocar de página: você clica em 'próxima' no Chrome."""
+    while True:
+        r = input("\n Não consegui ir para a próxima página. Clique em 'próxima' no Chrome, "
+                  "espere a lista carregar e pressione ENTER (ou digite FIM para parar a coleta): ")
+        if r.strip().lower() == "fim":
+            return False
+        if esperar_troca(page, antes, 5):
+            return True
+        print(" A lista continua igual à anterior.")
+
+
 def ir_para_proxima_pagina(page, antes, timeout=60):
-    """Clica em 'próxima' e espera a tabela trocar de conteúdo. False se já está na última.
+    """Clica em 'próxima' e espera a tabela trocar de conteúdo.
+    Retorna "ok", "fim" (já está na última) ou "falhou".
     (Os botões numerados não servem: o paginador só mostra ~10 deles por vez.)"""
     try:
         btn = achar_no_paginador(page, ".ui-paginator-next")
-        if btn is None or "ui-state-disabled" in (btn.get_attribute("class") or ""):
-            return False
+        if btn is None:
+            if not any(page.locator(p).count() for p in SEL["paginadores"]):
+                return "fim"  # lista sem paginador = uma página só
+            print(" Botão 'próxima' do paginador não encontrado.")
+            return "falhou"
+        if "ui-state-disabled" in (btn.get_attribute("class") or ""):
+            return "fim"
         contador_antes = texto_contador(page)
-        btn.click()
+        clicar(btn)
         # O PrimeFaces troca a tabela via AJAX: espera o conteúdo mudar de fato
         limite = time.time() + timeout
         reclicar = time.time() + 15
@@ -126,7 +181,7 @@ def ir_para_proxima_pagina(page, antes, timeout=60):
             agora = extrair_numeros_processos_pagina(page)
             if agora and agora != antes:
                 page.wait_for_timeout(1000)
-                return True
+                return "ok"
             # O clique às vezes se perde. Clica de novo uma vez, só se o contador não mudou
             # (se a página já trocou, outro clique pularia uma página).
             if reclicar and time.time() > reclicar:
@@ -137,12 +192,13 @@ def ir_para_proxima_pagina(page, antes, timeout=60):
         print(f" A próxima página não carregou em {timeout}s "
               f"(contador antes: '{contador_antes}', agora: '{texto_contador(page)}').")
     except Exception as e:
-        print(f" Erro ao ir para a próxima página: {e}")
-    return False
+        print(f" Erro ao ir para a próxima página: {type(e).__name__}: {e}")
+    return "falhou"
 
 
 def coletar_todos_processos(page):
     todos = []
+    ir_para_primeira_pagina(page)
     total_paginas = obter_total_paginas(page)
     print(f" Coletando processos de {total_paginas} página(s)...")
     pagina = 1
@@ -150,9 +206,11 @@ def coletar_todos_processos(page):
         nums = extrair_numeros_processos_pagina(page)
         todos.extend(nums)
         print(f"Página {pagina}: {len(nums)} processos. Total parcial: {len(todos)}")
-        if not ir_para_proxima_pagina(page, nums):
-            if pagina < total_paginas:
-                print(f" Não foi possível ir à página {pagina + 1} de {total_paginas}. Parando coleta.")
+        resultado = ir_para_proxima_pagina(page, nums)
+        if resultado == "fim":
+            break
+        if resultado == "falhou" and not avancar_manual(page, nums):
+            print(f" Coleta interrompida na página {pagina} de {total_paginas}.")
             break
         pagina += 1
     # remove duplicados mantendo a ordem
